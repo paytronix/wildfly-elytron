@@ -54,6 +54,18 @@ import org.wildfly.security.credential.store.impl.VaultCredentialStore;
 import org.wildfly.security.password.interfaces.ClearPassword;
 import org.wildfly.security.util.PasswordBasedEncryptionUtil;
 
+//
+// Paytronix imports!!
+//
+import java.util.Base64;
+import java.math.BigInteger;
+import java.security.InvalidKeyException;
+import javax.crypto.BadPaddingException;
+import javax.crypto.Cipher;
+import javax.crypto.IllegalBlockSizeException;
+import javax.crypto.NoSuchPaddingException;
+import javax.crypto.spec.SecretKeySpec;
+
 /**
  * Command to perform conversion from former Vault storage to Credential Store (KeyStoreCredentialStore).
  *
@@ -224,7 +236,6 @@ public class VaultCommand extends Command {
                 printSummary(keystorePassword, salt, iterationCount, convertedOptions);
             }
         }
-
     }
 
     private void checkInvalidOptions(String... invalidOptions) throws Exception {
@@ -324,12 +335,73 @@ public class VaultCommand extends Command {
                 getProvidersSupplier(csOtherProviders).get());
         for (String alias : vaultCredentialStore.getAliases()) {
             PasswordCredential credential = vaultCredentialStore.retrieve(alias, PasswordCredential.class);
-            convertedCredentialStore.store(alias, credential);
+
+            // Heeey so yeah, this block here is some logic which I, Matthew Explosion, have added to do two things not originally included in this tool:
+            // 1. Remove the "default_block::" prefix from the aliases, as that is useless to Paytronix
+            // 2. Decrypt the weird encrypted passwords that required using the now deprecated PxDatabaseLoginModule because this already stores the passwords encrypted and so double encrypting seems weird
+            //    ...and also I had trouble getting that PxDatabaseLoginModule to work with Wildfly 20.0.1
+            // So yeah, that's the deal. This code isn't neat and tidy because it's sort of throwaway -- once we run this on all environments it should never be needed again
+
+            String pxDecryptionKeyEnvVarName = "PX_VAULT_DB_PASS_DECRYPTION_KEY";
+            String pxDecryptionKey = System.getenv(pxDecryptionKeyEnvVarName);
+            if (pxDecryptionKey == null) {
+                throw new NullPointerException("This is the special magic Paytronix vault conversion tool so you know... gotta set env var PX_VAULT_DB_PASS_DECRYPTION_KEY to some base64-encoded DB password key");
+            }
+            byte[] kbytes = pxGetKeyBytes(pxDecryptionKey);
+            String actualAlias = alias;
+            String defaultBlockPrefix = "default_block::";
+            if (alias.startsWith(defaultBlockPrefix)) {
+                actualAlias = alias.substring(defaultBlockPrefix.length());
+                if (credential.getPassword() instanceof ClearPassword) {
+                    ClearPassword clearPassword = (ClearPassword)credential.getPassword();
+                    String plainTextPassword = new String(clearPassword.getPassword());
+                    String actualPlainTextPassword = plainTextPassword;
+                    System.out.println("Converting vault alias " + alias + " to " + actualAlias);
+                    try {
+                        actualPlainTextPassword = new String(pxDecodeWeirdDbPassword(kbytes, plainTextPassword));
+                        System.out.println("Removed double encryption on old DB password, using only Elytron's encryption");
+                    } catch (Exception e) { }
+                    credential = new PasswordCredential(ClearPassword.createRaw(credential.getAlgorithm(), actualPlainTextPassword.toCharArray()));
+                }
+            }
+
+            // End weird Paytronix stuff
+
+
+            convertedCredentialStore.store(actualAlias, credential);
         }
         convertedCredentialStore.flush();
 
         return convertedOptions;
     }
+
+
+    // This function and the next one are definitely ALSO Paytronix stuff
+    private static char[] pxDecodeWeirdDbPassword(byte[] kbytes, String secret)
+        throws NoSuchPaddingException, NoSuchAlgorithmException,
+        InvalidKeyException, BadPaddingException, IllegalBlockSizeException {
+        SecretKeySpec key = new SecretKeySpec(kbytes, "Blowfish");
+
+        BigInteger n = new BigInteger(secret, 16);
+        byte[] encoding = n.toByteArray();
+
+        Cipher cipher = Cipher.getInstance("Blowfish");
+        cipher.init(Cipher.DECRYPT_MODE, key);
+        byte[] decode = cipher.doFinal(encoding);
+
+        return new String(decode).toCharArray();
+    }
+
+    /**
+     * Method to return the byte array representing the encryption/decryption key.
+     *
+     * @return  byte array representing key
+     */
+    private static byte[] pxGetKeyBytes(String base64EncodedKeyBytes) {
+        return Base64.getDecoder().decode(base64EncodedKeyBytes);
+    }
+
+    // End Paytronix stuff
 
     private List<Descriptor> parseDescriptorFile(String descriptorFileLocation) throws IOException {
         try (BufferedReader descriptorFile = new BufferedReader(new FileReader(new File(descriptorFileLocation)))) {
